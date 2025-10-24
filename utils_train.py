@@ -1,0 +1,104 @@
+"""
+utils_train.py
+Shared utilities for training (AR and Diffusion)
+------------------------------------------------
+Includes:
+- split_dataset(): deterministic 90/10 train/val split
+- EarlyStopper: tracks validation loss, patience, and triggers early stopping
+- save_checkpoint(): saves last.pt and best.pt
+- plot_losses(): live interactive matplotlib plotting of training/validation loss curves
+"""
+
+import os
+import torch
+import matplotlib.pyplot as plt
+from torch.utils.data import random_split
+
+# ----------------------------------------------------
+# Dataset splitting
+# ----------------------------------------------------
+def split_dataset(dataset, val_ratio=0.1, seed=1337):
+    """Deterministically split dataset into train/val (default 90/10)."""
+    n_total = len(dataset)
+    n_val = int(n_total * val_ratio)
+    n_train = n_total - n_val
+    generator = torch.Generator().manual_seed(seed)
+    train_ds, val_ds = random_split(dataset, [n_train, n_val], generator=generator)
+    return train_ds, val_ds
+
+# ----------------------------------------------------
+# Checkpoint utilities
+# ----------------------------------------------------
+def save_checkpoint(model, optimizer, step, val_loss, out_dir, tag="last", best=False):
+    os.makedirs(out_dir, exist_ok=True)
+    ckpt_path = os.path.join(out_dir, f"{tag}.pt")
+    torch.save({
+        'state_dict': model.state_dict(),
+        'optimizer': optimizer.state_dict(),
+        'step': step,
+        'val_loss': val_loss,
+    }, ckpt_path)
+    if best:
+        best_path = os.path.join(out_dir, 'best.pt')
+        torch.save({
+            'state_dict': model.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'step': step,
+            'val_loss': val_loss,
+        }, best_path)
+    print(f"💾 Saved checkpoint to {ckpt_path} ({'best' if best else tag})")
+
+# ----------------------------------------------------
+# Early stopping
+# ----------------------------------------------------
+class EarlyStopper:
+    def __init__(self, patience=5, delta=1e-4):
+        self.patience = patience
+        self.delta = delta
+        self.best_loss = float('inf')
+        self.counter = 0
+        self.should_stop = False
+    def step(self, val_loss):
+        improved = val_loss < (self.best_loss - self.delta)
+        if improved:
+            self.best_loss = val_loss
+            self.counter = 0
+        else:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.should_stop = True
+        return improved
+
+# ----------------------------------------------------
+# Loss plotting
+# ----------------------------------------------------
+class LiveLossPlot:
+    def __init__(self, title="Training vs Validation Loss"):
+        plt.ion()
+        self.fig, self.ax = plt.subplots()
+        self.title = title
+        self.train_losses = []
+        self.val_losses = []
+        self.steps = []
+    def update(self, step, train_loss, val_loss=None):
+        self.steps.append(step)
+        self.train_losses.append(train_loss)
+        if val_loss is not None:
+            self.val_losses.append(val_loss)
+        self.ax.clear()
+        self.ax.plot(self.steps, self.train_losses, label='Train Loss', color='tab:blue')
+        if len(self.val_losses) > 0:
+            # align validation losses by step interval if shorter
+            val_x = self.steps[:len(self.val_losses)]
+            self.ax.plot(val_x, self.val_losses, label='Val Loss', color='tab:orange')
+        self.ax.set_xlabel('Step')
+        self.ax.set_ylabel('Loss')
+        self.ax.set_title(self.title)
+        self.ax.legend()
+        plt.pause(0.01)
+    def close(self):
+        plt.ioff()
+        plt.show()
+
+def plot_losses():
+    return LiveLossPlot()

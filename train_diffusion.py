@@ -24,6 +24,12 @@ from torch.utils.data import Dataset, DataLoader
 from model_diffusion import DiffConfig, DiffusionDecoder, corrupt_with_masks, masked_xent_loss, sample_iterative
 from model import ARLanguageModel, ARConfig  # from Phase 2
 
+from utils_train import (
+    split_dataset,
+    EarlyStopper,
+    save_checkpoint,
+    plot_losses
+)
 class TextDataset(Dataset):
     def __init__(self, path_txt: str, sp_model: str, max_seq_len: int):
         self.lines = []
@@ -79,6 +85,11 @@ def main():
     parser.add_argument('--schedule', type=str, default='linear', choices=['linear','cosine'])
     parser.add_argument('--seed', type=int, default=1337)
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu'))
+    
+    parser.add_argument('--patience', type=int, default=5, help='Early stopping patience (eval intervals)')
+    parser.add_argument('--val_ratio', type=float, default=0.1, help='Validation split ratio')
+    parser.add_argument('--plot', action='store_true', help='Show live training/validation loss plot')
+    
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -91,9 +102,16 @@ def main():
     mask_id = sp.piece_to_id('[MASK]') if sp.piece_to_id('[MASK]') >= 0 else vocab_size - 1
 
     # Data
-    ds = TextDataset(args.corpus, args.spm, args.max_len)
-    dl = DataLoader(ds, batch_size=args.batch_size, shuffle=True, drop_last=True, num_workers=2, pin_memory=True, collate_fn=batchify)
+    # ds = TextDataset(args.corpus, args.spm, args.max_len)
+    # dl = DataLoader(ds, batch_size=args.batch_size, shuffle=True, drop_last=True, num_workers=2, pin_memory=True, collate_fn=batchify)
 
+    ds = TextDataset(args.corpus, args.spm, args.max_len)
+    train_ds, val_ds = split_dataset(ds, val_ratio=args.val_ratio, seed=args.seed)
+
+    train_dl = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, drop_last=True, num_workers=2, pin_memory=True, collate_fn=batchify)
+    val_dl   = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, drop_last=False, num_workers=2, pin_memory=True, collate_fn=batchify)
+    
+    
     # Load AR encoder (frozen)
     ar_ckpt = torch.load(args.ar_ckpt, map_location='cpu')
     ar_cfg = ARConfig(**ar_ckpt['config'])
@@ -129,13 +147,18 @@ def main():
             return args.lr * (step + 1) / max(1, args.warmup_steps)
         return sched.get_last_lr()[0]
 
+    stopper = EarlyStopper(patience=args.patience)
+    plotter = plot_losses() if args.plot else None
+
+    best_val_loss = float('inf')
+
     # Train loop
     step = 0
     running = 0.0
     t0 = time.time()
     diff.train()
     while step < args.max_steps:
-        for ids, attn in dl:
+        for ids, attn in train_dl:
             ids = ids.to(args.device)
             attn = attn.to(args.device)
             B = ids.size(0)
@@ -167,26 +190,57 @@ def main():
                 print(f"step {step:06d} | loss {running/100:.4f} | lr {opt.param_groups[0]['lr']:.2e} | {(step)/dt:.1f} it/s")
                 running = 0.0
             if step % args.eval_every == 0:
+                # --- Validation + Sampling ---
                 diff.eval()
+                val_loss_total = 0.0
                 with torch.no_grad():
-                    # quick qualitative sample
+                    # compute validation loss
+                    for v_ids, v_attn in val_dl:
+                        v_ids, v_attn = v_ids.to(args.device), v_attn.to(args.device)
+                        Bv = v_ids.size(0)
+                        z_val = ar.encode(v_ids, v_attn, pool='mean')
+                        t_val = torch.randint(low=1, high=diff_cfg.T + 1, size=(Bv,), device=args.device)
+                        x_noisy, predict_mask = corrupt_with_masks(v_ids, pad_id, mask_id, t_val, diff_cfg.T, schedule=args.schedule)
+                        v_logits = diff(x_noisy, v_attn, t_val, z_val)
+                        v_loss = masked_xent_loss(v_logits, v_ids, predict_mask, pad_id)
+                        val_loss_total += v_loss.item()
+                    val_loss = val_loss_total / len(val_dl)
+                print(f"\nValidation loss: {val_loss:.4f}\n")
+
+                # --- Qualitative samples ---
+                with torch.no_grad():
                     lengths = torch.tensor([64, 96], device=args.device)
                     z_small = z[:2]
                     gens = sample_iterative(diff, lengths, z_small, pad_id, mask_id, diff_cfg.T, bos_id, eos_id, topk=50, device=args.device)
                     for i, seq in enumerate(gens):
                         seq_nopad = seq[seq != pad_id]
-                        # decode with SPM (skip special tokens except BOS/EOS handling)
                         tokens = [int(x.item()) for x in seq_nopad]
-                        # remove BOS/EOS if present
                         if tokens and tokens[0] == bos_id:
                             tokens = tokens[1:]
                         if tokens and tokens[-1] == eos_id:
                             tokens = tokens[:-1]
                         text = sp.decode(tokens)
                         print(f"\n=== SAMPLE {i} ===\n{text[:400]}\n")
+
+                # --- Early stopping, checkpointing, plotting ---
+                save_checkpoint(diff, opt, step, val_loss, args.out_dir, tag='last')
+                improved = stopper.step(val_loss)
+                if improved:
+                    save_checkpoint(diff, opt, step, val_loss, args.out_dir, tag=f'step{step}', best=True)
+                    best_val_loss = val_loss
+                if stopper.should_stop:
+                    print(f"Early stopping triggered (no improvement for {args.patience} evals). Best val_loss={best_val_loss:.4f}")
+                    break
+
+                if plotter:
+                    plotter.update(step, running / max(1, step % args.eval_every), val_loss)
+
                 diff.train()
             if step >= args.max_steps:
                 break
+
+    if plotter:
+        plotter.close()
 
     # Save
     path = os.path.join(args.out_dir, 'diff.pt')

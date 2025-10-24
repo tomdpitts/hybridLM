@@ -24,6 +24,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from model import ARLanguageModel, ARConfig
 
+from utils_train import (
+    split_dataset,
+    EarlyStopper,
+    save_checkpoint,
+    plot_losses
+)
+
 class TextDataset(Dataset):
     def __init__(self, path_txt: str, sp_model: str, max_seq_len: int):
         self.lines = []
@@ -74,6 +81,11 @@ def main():
     parser.add_argument('--eval_every', type=int, default=500) #1000 
     parser.add_argument('--seed', type=int, default=5337)
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu'))
+    
+    parser.add_argument('--patience', type=int, default=5, help='Early stopping patience (eval intervals)')
+    parser.add_argument('--val_ratio', type=float, default=0.1, help='Validation split ratio')
+    parser.add_argument('--plot', action='store_true', help='Show live training/validation loss plot')
+    
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -85,9 +97,16 @@ def main():
     vocab_size = args.vocab_size or sp.get_piece_size()
 
     # Data
-    ds = TextDataset(args.corpus, args.spm, args.max_len)
-    dl = DataLoader(ds, batch_size=args.batch_size, shuffle=True, drop_last=True, num_workers=2, pin_memory=True, collate_fn=batchify)
+    # ds = TextDataset(args.corpus, args.spm, args.max_len)
+    # dl = DataLoader(ds, batch_size=args.batch_size, shuffle=True, drop_last=True, num_workers=2, pin_memory=True, collate_fn=batchify)
 
+    ds = TextDataset(args.corpus, args.spm, args.max_len)
+    train_ds, val_ds = split_dataset(ds, val_ratio=args.val_ratio, seed=args.seed)
+
+    train_dl = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, drop_last=True, num_workers=2, pin_memory=True, collate_fn=batchify)
+    val_dl   = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, drop_last=False, num_workers=2, pin_memory=True, collate_fn=batchify)
+    
+    
     # Model
     cfg = ARConfig(vocab_size=vocab_size, n_layer=args.n_layer, n_head=args.n_head, n_embd=args.n_embd, max_seq_len=args.max_len, latent_dim=args.latent_dim)
     model = ARLanguageModel(cfg).to(args.device)
@@ -101,13 +120,18 @@ def main():
             return args.lr * (step + 1) / max(1, args.warmup_steps)
         return sched.get_last_lr()[0]
 
+    stopper = EarlyStopper(patience=args.patience)
+    plotter = plot_losses() if args.plot else None
+
+    best_val_loss = float('inf')
+
     # Training loop
     step = 0
     model.train()
     running_loss = 0.0
     t0 = time.time()
     while step < args.max_steps:
-        for ids, attn in dl:
+        for ids, attn in train_dl:
             ids = ids.to(args.device)
             attn = attn.to(args.device)
             logits = model(ids, attn)
@@ -134,16 +158,44 @@ def main():
                 print(f"step {step+1:06d} | loss {running_loss/100:.4f} | lr {opt.param_groups[0]['lr']:.2e} | {tok_per_step/1e6:.3f}M tok/it | {(step+1)/dt:.1f} it/s | time {dt:.2f} s")
                 running_loss = 0.0
             if (step + 1) % args.eval_every == 0:
+                # --- Validation pass ---
                 model.eval()
+                val_loss_total = 0.0
                 with torch.no_grad():
-                    ids_small = ids[:4]
-                    z = model.encode(ids_small, attn[:4], pool='mean')
-                    print(f"  encode(z) mean | norm={z.norm(dim=1).mean().item():.3f} dim={z.size(-1)}")
+                    for v_ids, v_attn in val_dl:
+                        v_ids, v_attn = v_ids.to(args.device), v_attn.to(args.device)
+                        v_logits = model(v_ids, v_attn)
+                        v_loss = F.cross_entropy(
+                            v_logits[:, :-1, :].contiguous().view(-1, cfg.vocab_size),
+                            v_ids[:, 1:].contiguous().view(-1),
+                            ignore_index=0,
+                        )
+                        val_loss_total += v_loss.item()
+                val_loss = val_loss_total / len(val_dl)
+                print(f"\nValidation loss: {val_loss:.4f}\n")
+
+                # --- Early stopping & checkpointing ---
+                save_checkpoint(model, opt, step, val_loss, args.out_dir, tag='last')
+                improved = stopper.step(val_loss)
+                if improved:
+                    save_checkpoint(model, opt, step, val_loss, args.out_dir, tag=f'step{step}', best=True)
+                    best_val_loss = val_loss
+                if stopper.should_stop:
+                    print(f"Early stopping triggered (no improvement for {args.patience} evals).\nBest val_loss={best_val_loss:.4f}")
+                    break
+
+                # --- Live plot update ---
+                if plotter:
+                    plotter.update(step, running_loss / max(1, step % args.eval_every), val_loss)
                 model.train()
             step += 1
             if step >= args.max_steps:
                 break
 
+
+    if plotter:
+        plotter.close()
+        
     # Save
     save_path = os.path.join(args.out_dir, 'ar.pt')
     torch.save({'config': cfg.__dict__, 'state_dict': model.state_dict(), 'spm': args.spm}, save_path)
