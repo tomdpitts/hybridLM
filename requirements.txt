@@ -1,3 +1,5 @@
 sentencepiece
 torch
 numpy
+matplotlib
+scikit-learn

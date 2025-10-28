@@ -71,20 +71,22 @@ def main():
     parser.add_argument('--max_len', type=int, default=256) #512
     parser.add_argument('--n_layer', type=int, default=8)
     parser.add_argument('--n_head', type=int, default=8)
-    parser.add_argument('--n_embd', type=int, default=256) #512
+    parser.add_argument('--n_embd', type=int, default=128) #512
     parser.add_argument('--latent_dim', type=int, default=256) #512
-    parser.add_argument('--batch_size', type=int, default=32)
-    parser.add_argument('--lr', type=float, default=3e-4)
+    parser.add_argument('--batch_size', type=int, default=16)
+    parser.add_argument('--lr', type=float, default=3e-3) #3e-4
     parser.add_argument('--weight_decay', type=float, default=0.01)
-    parser.add_argument('--warmup_steps', type=int, default=1000) #2000
-    parser.add_argument('--max_steps', type=int, default=10000) #20000
-    parser.add_argument('--eval_every', type=int, default=500) #1000 
+    parser.add_argument('--warmup_steps', type=int, default=100) #2000
+    parser.add_argument('--max_steps', type=int, default=1000) #20000
+    parser.add_argument('--eval_every', type=int, default=200) #1000 
     parser.add_argument('--seed', type=int, default=5337)
-    parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu'))
+    parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else ('cpu' if torch.backends.mps.is_available() else 'cpu'))
     
     parser.add_argument('--patience', type=int, default=5, help='Early stopping patience (eval intervals)')
     parser.add_argument('--val_ratio', type=float, default=0.1, help='Validation split ratio')
     parser.add_argument('--plot', action='store_true', help='Show live training/validation loss plot')
+    parser.add_argument('--print_interval', type=int, default=20, help='Print verbose training information every N steps')
+
     
     args = parser.parse_args()
 
@@ -152,7 +154,7 @@ def main():
                 sched.step()
 
             running_loss += loss.item()
-            if (step + 1) % 100 == 0:
+            if (step + 1) % args.print_interval == 0:
                 tok_per_step = ids.numel()
                 dt = time.time() - t0
                 print(f"step {step+1:06d} | loss {running_loss/100:.4f} | lr {opt.param_groups[0]['lr']:.2e} | {tok_per_step/1e6:.3f}M tok/it | {(step+1)/dt:.1f} it/s | time {dt:.2f} s")
@@ -195,7 +197,7 @@ def main():
 
     if plotter:
         plotter.close()
-        
+
     # Save
     save_path = os.path.join(args.out_dir, 'ar.pt')
     torch.save({'config': cfg.__dict__, 'state_dict': model.state_dict(), 'spm': args.spm}, save_path)

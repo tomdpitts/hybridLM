@@ -12,6 +12,7 @@ python train_diffusion.py --corpus data/input.txt --spm tokenizer/spm.model \
   --T 200 --schedule linear --eval_every 1000
 '''
 
+import math
 import os
 import time
 import argparse
@@ -74,13 +75,13 @@ def main():
     parser.add_argument('--spm', type=str, default='tokenizer/spm.model')
     parser.add_argument('--ar_ckpt', type=str, default='ckpts/ar.pt')
     parser.add_argument('--out_dir', type=str, default='ckpts')
-    parser.add_argument('--max_len', type=int, default=512)
+    parser.add_argument('--max_len', type=int, default=256) #512
     parser.add_argument('--batch_size', type=int, default=32)
-    parser.add_argument('--lr', type=float, default=1e-4)
+    parser.add_argument('--lr', type=float, default=1e-3) #1e-4
     parser.add_argument('--weight_decay', type=float, default=0.01)
-    parser.add_argument('--warmup_steps', type=int, default=1000)
-    parser.add_argument('--max_steps', type=int, default=20000)
-    parser.add_argument('--eval_every', type=int, default=1000)
+    parser.add_argument('--warmup_steps', type=int, default=10) #100? Maybe 1000
+    parser.add_argument('--max_steps', type=int, default=100) #20000
+    parser.add_argument('--eval_every', type=int, default=20) #1000
     parser.add_argument('--T', type=int, default=200)
     parser.add_argument('--schedule', type=str, default='linear', choices=['linear','cosine'])
     parser.add_argument('--seed', type=int, default=1337)
@@ -89,6 +90,7 @@ def main():
     parser.add_argument('--patience', type=int, default=5, help='Early stopping patience (eval intervals)')
     parser.add_argument('--val_ratio', type=float, default=0.1, help='Validation split ratio')
     parser.add_argument('--plot', action='store_true', help='Show live training/validation loss plot')
+    parser.add_argument('--print_interval', type=int, default=5, help='Print verbose training information every N steps')
     
     args = parser.parse_args()
 
@@ -106,17 +108,32 @@ def main():
     # dl = DataLoader(ds, batch_size=args.batch_size, shuffle=True, drop_last=True, num_workers=2, pin_memory=True, collate_fn=batchify)
 
     ds = TextDataset(args.corpus, args.spm, args.max_len)
-    train_ds, val_ds = split_dataset(ds, val_ratio=args.val_ratio, seed=args.seed)
+    train_ds, val_ds = split_dataset(ds, val_ratio=args.val_ratio, seed=args.seed) #
 
-    train_dl = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, drop_last=True, num_workers=2, pin_memory=True, collate_fn=batchify)
+    train_dl = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, drop_last=True, num_workers=2, pin_memory=True, collate_fn=batchify) # 
     val_dl   = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, drop_last=False, num_workers=2, pin_memory=True, collate_fn=batchify)
     
     
-    # Load AR encoder (frozen)
+    # --- Load AR encoder (frozen) ---
     ar_ckpt = torch.load(args.ar_ckpt, map_location='cpu')
     ar_cfg = ARConfig(**ar_ckpt['config'])
     ar = ARLanguageModel(ar_cfg).to(args.device)
-    ar.load_state_dict(ar_ckpt['state_dict'])
+    ar.load_state_dict(ar_ckpt['state_dict'], strict=False)
+
+    # 🔧 ensure sinusoidal pos_emb covers full requested length
+    if hasattr(ar.pos_emb, "pe"):
+        old_len, dim = ar.pos_emb.pe.shape
+        if old_len < args.max_len:
+            print(f"Extending sinusoidal PE from {old_len} → {args.max_len}")
+            device = ar.pos_emb.pe.device
+            position = torch.arange(0, args.max_len, dtype=torch.float, device=device).unsqueeze(1)
+            div_term = torch.exp(torch.arange(0, dim, 2, dtype=torch.float, device=device) * (-math.log(10000.0) / dim))
+            pe = torch.zeros(args.max_len, dim, device=device)
+            pe[:, 0::2] = torch.sin(position * div_term)
+            pe[:, 1::2] = torch.cos(position * div_term)
+            ar.pos_emb.pe = pe  # overwrite buffer with longer version
+
+    # freeze encoder
     for p in ar.parameters():
         p.requires_grad_(False)
     ar.eval()
@@ -164,13 +181,15 @@ def main():
             B = ids.size(0)
             # get conditioning z from AR
             with torch.no_grad():
-                z = ar.encode(ids, attn, pool='mean')  # (B, cond_dim)
+                # z = ar.encode(ids, attn, pool='mean')  # (B, cond_dim)
+                z_global = ar.encode(ids, attn, pool='mean', raw=True, mode="global")         # (B, n_embd)
+                z_chunks, chunk_mask = ar.encode(ids, attn, pool='mean', raw=True, mode="chunked")  # (B, num_chunks, D),
             # sample random timestep
             t = torch.randint(low=1, high=diff_cfg.T + 1, size=(B,), device=args.device)
             # corrupt
             x_noisy, predict_mask = corrupt_with_masks(ids, pad_id, mask_id, t, diff_cfg.T, schedule=args.schedule)
             # forward
-            logits = diff(x_noisy, attn, t, z)
+            logits = diff(x_noisy, attn, t, z_global)
             loss = masked_xent_loss(logits, ids, predict_mask, pad_id)
             # step
             opt.zero_grad(set_to_none=True)
@@ -185,9 +204,9 @@ def main():
 
             running += loss.item()
             step += 1
-            if step % 100 == 0:
+            if step % args.print_interval == 0:
                 dt = time.time() - t0
-                print(f"step {step:06d} | loss {running/100:.4f} | lr {opt.param_groups[0]['lr']:.2e} | {(step)/dt:.1f} it/s")
+                print(f"step {step:06d} | loss {running/100:.4f} | lr {opt.param_groups[0]['lr']:.2e} | {(step)/dt:.1f} it/s | time {dt:.2f} s")
                 running = 0.0
             if step % args.eval_every == 0:
                 # --- Validation + Sampling ---
@@ -210,7 +229,7 @@ def main():
                 # --- Qualitative samples ---
                 with torch.no_grad():
                     lengths = torch.tensor([64, 96], device=args.device)
-                    z_small = z[:2]
+                    z_small = z_global[:2]
                     gens = sample_iterative(diff, lengths, z_small, pad_id, mask_id, diff_cfg.T, bos_id, eos_id, topk=50, device=args.device)
                     for i, seq in enumerate(gens):
                         seq_nopad = seq[seq != pad_id]
@@ -246,6 +265,14 @@ def main():
     path = os.path.join(args.out_dir, 'diff.pt')
     torch.save({'config': diff_cfg.__dict__, 'state_dict': diff.state_dict(), 'spm': args.spm}, path)
     print(f"✅ Saved diffusion decoder to {path}")
+
+    end_time = time.time()
+    total_time = end_time - t0
+
+    print(f"Total training time: {total_time:.2f} s")
+    print(f"Average latency per iteration: {total_time/args.max_steps:.2f} s")
+    print(f"Total tokens: {ids.numel()}")
+    print(f"Throughput: {ids.numel()/total_time:.2f} tokens/s")
 
 if __name__ == '__main__':
     main()

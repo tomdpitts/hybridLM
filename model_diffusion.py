@@ -18,6 +18,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from model import ARConfig
 
 # -----------------------------
 # Config
@@ -29,13 +30,13 @@ class DiffConfig:
     mask_id: int = 4  # NOTE: update at runtime after loading SPM if needed
     bos_id: int = 2
     eos_id: int = 3
-    max_len: int = 512
+    max_len: int = ARConfig.max_seq_len #512
     n_layer: int = 8
     n_head: int = 8
-    n_embd: int = 512
+    n_embd: int = ARConfig.n_embd #512
     dropout: float = 0.1
     T: int = 200  # diffusion steps for training
-    cond_dim: int = 512  # z dimension from AR encode()
+    cond_dim: int = ARConfig.n_embd #512 # z dimension from AR encode() - this should be kept consistent with the AR model!
 
 # -----------------------------
 # Building blocks
@@ -112,7 +113,7 @@ class DiffusionDecoder(nn.Module):
         self.time_emb = TimeEmbedding(cfg.T, cfg.n_embd)
         # simple additive conditioning on z, with small adaptor
         self.cond_ln = nn.LayerNorm(cfg.cond_dim)
-        self.cond_proj = nn.Linear(cfg.cond_dim, cfg.n_embd)
+        # self.cond_proj = nn.Linear(cfg.cond_dim, cfg.n_embd) # deprecated 
         self.drop = nn.Dropout(cfg.dropout)
         self.blocks = nn.ModuleList([Block(cfg.n_embd, cfg.n_head, cfg.dropout) for _ in range(cfg.n_layer)])
         self.ln_f = nn.LayerNorm(cfg.n_embd)
@@ -134,8 +135,8 @@ class DiffusionDecoder(nn.Module):
         pos = torch.arange(L, device=x_noisy.device).unsqueeze(0).expand(B, L)
         # embeddings
         h = self.tok_emb(x_noisy) + self.pos_emb(pos) + self.time_emb(t).unsqueeze(1)
-        cz = self.cond_proj(self.cond_ln(z)).unsqueeze(1)  # (B,1,D)
-        h = self.drop(h + cz)  # broadcast add
+        # cz = self.cond_proj(self.cond_ln(z)).unsqueeze(1)  # (B,1,D) # deprecated
+        h = self.drop(h)  # broadcast add
         key_padding_mask = attn_mask  # 1=keep, 0=pad -> pass directly
         for blk in self.blocks:
             h = blk(h, key_padding_mask)

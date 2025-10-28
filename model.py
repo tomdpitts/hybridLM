@@ -126,7 +126,7 @@ class ARLanguageModel(nn.Module):
         self.ln_f = nn.LayerNorm(cfg.n_embd, eps=cfg.layer_norm_eps)
         self.lm_head = nn.Linear(cfg.n_embd, cfg.vocab_size, bias=False)
         # latent projection
-        self.z_proj = nn.Linear(cfg.n_embd, cfg.latent_dim)
+        # self.z_proj = nn.Linear(cfg.n_embd, cfg.latent_dim) # deprecated design choice I'm abandoning
         self.apply(self._init)
 
     def _init(self, module):
@@ -149,9 +149,10 @@ class ARLanguageModel(nn.Module):
         return logits
 
     @torch.no_grad()
-    def encode(self, idx, attn_mask=None, pool: str = "mean"):
+    def encodeOLD(self, idx, attn_mask=None, pool: str = "mean", raw: bool = True):
         """Return a global latent z for the sequence.
         pool: 'mean' over non-PAD tokens, or 'last' (use last non-PAD / EOS position).
+        raw: if True, return pooled pre-projection representation
         """
         self.eval()
         B, L = idx.shape
@@ -168,7 +169,132 @@ class ARLanguageModel(nn.Module):
         else:  # 'last'
             # find last non-pad, prefer EOS if present
             last_idx = (attn_mask * torch.arange(L, device=idx.device)).argmax(dim=1)
-            gathered = x[torch.arange(B, device=idx.device), last_idx]
-            pooled = gathered
+            pooled = x[torch.arange(B, device=idx.device), last_idx]
+        
+        # Update: always return the raw latent vector
+        if raw:
+            return pooled  # (B, n_embd) semantic latent vector
+
         z = self.z_proj(pooled)
         return z  # (B, latent_dim)
+
+
+    @torch.no_grad()
+    def encode(
+        self,
+        idx,
+        attn_mask=None,
+        pool: str = "mean",
+        raw: bool = True,
+        mode: str = "global",
+        chunk_size: int = 32,
+    ):
+        """
+        Returns latent representations of the sequence.
+
+        mode:
+            "global"  -> single vector [B, D] (existing behavior)
+            "chunked" -> multiple vectors per example [B, num_chunks, D]
+
+        pool:
+            "mean" -> mean over selected tokens
+            "last" -> last non-pad token
+
+        raw:
+            if True, return pooled contextual state(s) directly (B, D) or (B, C, D)
+            if False, would apply projection head (deprecated in our design)
+
+        chunk_size:
+            only used when mode="chunked". We take non-pad tokens, break them
+            into contiguous spans of length `chunk_size`, and pool each span.
+
+        Notes:
+            - This does NOT change training. It's just a readout function.
+            - We assume BOS/EOS are just tokens like any others; they get pooled, too.
+        """
+        self.eval()
+        B, L = idx.shape
+
+        # Embedding + transformer forward
+        x = self.tok_emb(idx)            # (B, L, D)
+        x = x + self.pos_emb(x)          # (B, L, D)
+        for blk in self.blocks:
+            x = blk(x, attn_mask)
+        x = self.ln_f(x)                 # (B, L, D)
+
+        # Build attention mask if not given
+        if attn_mask is None:
+            attn_mask = (idx != self.pad_id).long()  # (B, L)
+
+        # ============ MODE: GLOBAL (legacy single-z) ============
+        if mode == "global":
+            if pool == "mean":
+                denom = attn_mask.sum(dim=1, keepdim=True).clamp(min=1)          # (B,1)
+                pooled = (x * attn_mask.unsqueeze(-1)).sum(dim=1) / denom        # (B,D)
+            else:  # 'last'
+                last_idx = (attn_mask * torch.arange(L, device=idx.device)).argmax(dim=1)
+                pooled = x[torch.arange(B, device=idx.device), last_idx]         # (B,D)
+
+            if raw:
+                return pooled  # (B, D)
+
+            # fallback path if we ever reintroduce z_proj
+            return self.z_proj(pooled)
+
+        # ============ MODE: CHUNKED (multi-z) ============
+        elif mode == "chunked":
+            # We'll produce multiple pooled vectors per sequence.
+            # Steps:
+            # 1. For each example in batch, gather only the valid (non-pad) tokens.
+            # 2. Break them into contiguous spans of up to chunk_size tokens.
+            # 3. Mean-pool x over each span.
+            # 4. Pad the list of spans across batch so we can return a tensor.
+
+            device = idx.device
+            B, L, D = x.shape
+            chunked_reprs = []
+            max_chunks = 0
+
+            for b in range(B):
+                valid_mask = attn_mask[b].bool()        # (L,)
+                x_valid = x[b][valid_mask]              # (T_valid, D)
+
+                if x_valid.size(0) == 0:
+                    # edge case: sequence is all PAD?
+                    pooled_chunks = x_valid.new_zeros((1, D))  # [1, D]
+                else:
+                    # break into spans of chunk_size
+                    spans = []
+                    for start in range(0, x_valid.size(0), chunk_size):
+                        end = start + chunk_size
+                        span = x_valid[start:end]       # (<=chunk_size, D)
+                        span_mean = span.mean(dim=0)    # (D,)
+                        spans.append(span_mean)
+                    pooled_chunks = torch.stack(spans, dim=0)  # (num_chunks, D)
+
+                chunked_reprs.append(pooled_chunks)
+                if pooled_chunks.size(0) > max_chunks:
+                    max_chunks = pooled_chunks.size(0)
+
+            # Now we need to batch these into a single tensor.
+            # We'll pad with zeros for sequences that have fewer chunks.
+            out = x.new_zeros((B, max_chunks, D))  # (B, C, D)
+            chunk_mask = torch.zeros(B, max_chunks, dtype=torch.bool, device=device)
+
+            for b in range(B):
+                Cb = chunked_reprs[b].size(0)
+                out[b, :Cb] = chunked_reprs[b]
+                chunk_mask[b, :Cb] = True
+
+            # out: [B, C, D]
+            # chunk_mask: [B, C] tells you which chunks are "real"
+
+            if raw:
+                return out, chunk_mask  # (B, C, D), (B, C)
+
+            # if you ever reintroduce z_proj to change dim:
+            # projected_out = self.z_proj(out)  # would become (B, C, latent_dim)
+            # return projected_out, chunk_mask
+
+        else:
+            raise ValueError(f"Unknown encode mode {mode!r}")
