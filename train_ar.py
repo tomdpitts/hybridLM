@@ -6,7 +6,7 @@
 
 '''
 # assuming you already ran tokenizer.py
-python train_ar.py --corpus data/input.txt --spm tokenizer/spm.model \
+python train_ar.py --corpus data/train.txt --spm tokenizer/spm.model \
   --max_len 512 --n_layer 8 --n_head 8 --n_embd 512 --latent_dim 512 \
   --batch_size 32 --lr 3e-4 --max_steps 20000
 '''

@@ -7,7 +7,7 @@
 
 
 '''
-python train_diffusion.py --corpus data/input.txt --spm tokenizer/spm.model \
+python train_diffusion.py --corpus data/train.txt --spm tokenizer/spm.model \
   --ar_ckpt ckpts/ar.pt --max_len 512 --batch_size 32 --lr 1e-4 \
   --T 200 --schedule linear --eval_every 1000
 '''
