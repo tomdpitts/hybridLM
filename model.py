@@ -150,6 +150,7 @@ class ARLanguageModel(nn.Module):
 
     @torch.no_grad()
     def encodeOLD(self, idx, attn_mask=None, pool: str = "mean", raw: bool = True):
+        # DEPRECATED, NOT IN USE
         """Return a global latent z for the sequence.
         pool: 'mean' over non-PAD tokens, or 'last' (use last non-PAD / EOS position).
         raw: if True, return pooled pre-projection representation
@@ -193,7 +194,7 @@ class ARLanguageModel(nn.Module):
         Returns latent representations of the sequence.
 
         mode:
-            "global"  -> single vector [B, D] (existing behavior)
+            "global"  -> single vector [B, D] (previous behavior)
             "chunked" -> multiple vectors per example [B, num_chunks, D]
 
         pool:
@@ -277,7 +278,7 @@ class ARLanguageModel(nn.Module):
                     max_chunks = pooled_chunks.size(0)
 
             # Now we need to batch these into a single tensor.
-            # We'll pad with zeros for sequences that have fewer chunks.
+            # We pad with zeros for sequences that have fewer chunks.
             out = x.new_zeros((B, max_chunks, D))  # (B, C, D)
             chunk_mask = torch.zeros(B, max_chunks, dtype=torch.bool, device=device)
 

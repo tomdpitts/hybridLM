@@ -56,8 +56,8 @@ def decode_tokens(sp, tokens, bos_id=2, eos_id=3, pad_id=0):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--spm', type=str, default='tokenizer/spm.model')
-    parser.add_argument('--ar_ckpt', type=str, default='ckpts/ar.pt')
-    parser.add_argument('--diff_ckpt', type=str, default='ckpts/diff.pt')
+    parser.add_argument('--ar_ckpt', type=str, default='ckpts/ar/ar.pt')
+    parser.add_argument('--diff_ckpt', type=str, default='ckpts/diff/diff.pt')
     parser.add_argument('--prompt', type=str, default='Once upon a time,')
     parser.add_argument('--max_len', type=int, default=512)
     parser.add_argument('--steps', type=int, default=64, help='Sampling steps (<= training T)')

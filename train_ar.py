@@ -66,7 +66,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--corpus', type=str, required=True, help='Path to training text (one doc per line).')
     parser.add_argument('--spm', type=str, default='tokenizer/spm.model', help='SentencePiece model path.')
-    parser.add_argument('--out_dir', type=str, default='ckpts')
+    parser.add_argument('--out_dir', type=str, default='ckpts/ar')
     parser.add_argument('--vocab_size', type=int, default=None, help='If None, inferred from spm.')
     parser.add_argument('--max_len', type=int, default=256) #512
     parser.add_argument('--n_layer', type=int, default=8)
@@ -76,15 +76,15 @@ def main():
     parser.add_argument('--batch_size', type=int, default=16)
     parser.add_argument('--lr', type=float, default=3e-3) #3e-4
     parser.add_argument('--weight_decay', type=float, default=0.01)
-    parser.add_argument('--warmup_steps', type=int, default=100) #2000
-    parser.add_argument('--max_steps', type=int, default=1000) #20000
-    parser.add_argument('--eval_every', type=int, default=200) #1000 
+    parser.add_argument('--warmup_steps', type=int, default=10) #2000
+    parser.add_argument('--max_steps', type=int, default=100) #20000
+    parser.add_argument('--eval_every', type=int, default=20) #1000 
     parser.add_argument('--seed', type=int, default=5337)
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else ('cpu' if torch.backends.mps.is_available() else 'cpu'))
     
     parser.add_argument('--patience', type=int, default=5, help='Early stopping patience (eval intervals)')
     parser.add_argument('--val_ratio', type=float, default=0.1, help='Validation split ratio')
-    parser.add_argument('--plot', action='store_true', help='Show live training/validation loss plot')
+    parser.add_argument('--plot', action='store_true', help='Show live training/validation loss plot', default=True)
     parser.add_argument('--print_interval', type=int, default=20, help='Print verbose training information every N steps')
 
     
@@ -199,7 +199,7 @@ def main():
         plotter.close()
 
     # Save
-    save_path = os.path.join(args.out_dir, 'ar.pt')
+    save_path = os.path.join(args.out_dir, 'ar/ar.pt') # Note that the frozen model weights are saved to ar.pt
     torch.save({'config': cfg.__dict__, 'state_dict': model.state_dict(), 'spm': args.spm}, save_path)
     print(f"✅ Saved AR encoder to {save_path}")
 

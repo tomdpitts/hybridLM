@@ -73,14 +73,14 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--corpus', type=str, required=True)
     parser.add_argument('--spm', type=str, default='tokenizer/spm.model')
-    parser.add_argument('--ar_ckpt', type=str, default='ckpts/ar.pt')
-    parser.add_argument('--out_dir', type=str, default='ckpts')
+    parser.add_argument('--ar_ckpt', type=str, default='ckpts/ar/ar.pt')
+    parser.add_argument('--out_dir', type=str, default='ckpts/diff')
     parser.add_argument('--max_len', type=int, default=256) #512
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--lr', type=float, default=1e-3) #1e-4
     parser.add_argument('--weight_decay', type=float, default=0.01)
     parser.add_argument('--warmup_steps', type=int, default=10) #100? Maybe 1000
-    parser.add_argument('--max_steps', type=int, default=100) #20000
+    parser.add_argument('--max_steps', type=int, default=101) #20000
     parser.add_argument('--eval_every', type=int, default=20) #1000
     parser.add_argument('--T', type=int, default=200)
     parser.add_argument('--schedule', type=str, default='linear', choices=['linear','cosine'])
@@ -89,7 +89,7 @@ def main():
     
     parser.add_argument('--patience', type=int, default=5, help='Early stopping patience (eval intervals)')
     parser.add_argument('--val_ratio', type=float, default=0.1, help='Validation split ratio')
-    parser.add_argument('--plot', action='store_true', help='Show live training/validation loss plot')
+    parser.add_argument('--plot', action='store_true', help='Show live training/validation loss plot', default=True)
     parser.add_argument('--print_interval', type=int, default=5, help='Print verbose training information every N steps')
     
     args = parser.parse_args()
@@ -251,15 +251,15 @@ def main():
                     print(f"Early stopping triggered (no improvement for {args.patience} evals). Best val_loss={best_val_loss:.4f}")
                     break
 
-                if plotter:
-                    plotter.update(step, running / max(1, step % args.eval_every), val_loss)
+                # if plotter:
+                #     plotter.update(step, running / max(1, step % args.eval_every), val_loss)
 
                 diff.train()
             if step >= args.max_steps:
                 break
 
-    if plotter:
-        plotter.close()
+    # if plotter:
+    #     plotter.close()
 
     # Save
     path = os.path.join(args.out_dir, 'diff.pt')

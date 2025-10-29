@@ -45,7 +45,7 @@ def sample(model, sp, prompt, max_new_tokens=64, top_k=50, temperature=1.0, devi
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--ckpt", type=str, default="ckpts/ar.pt")
+    parser.add_argument("--ckpt", type=str, default="ckpts/ar/ar.pt")
     parser.add_argument("--spm", type=str, default="tokenizer/spm.model")
     parser.add_argument("--prompt", type=str, required=True)
     parser.add_argument("--max_new_tokens", type=int, default=1000)

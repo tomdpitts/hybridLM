@@ -48,6 +48,53 @@ def save_checkpoint(model, optimizer, step, val_loss, out_dir, tag="last", best=
         }, best_path)
     print(f"💾 Saved checkpoint to {ckpt_path} ({'best' if best else tag})")
 
+# def save_checkpoint(model, optimizer, step, val_loss, out_dir, tag="last", best=False):
+#     """
+#     Save checkpoint to disk, automatically grouping AR and Diffusion models into
+#     separate subdirectories under `out_dir`.
+
+#     Example:
+#         ckpts/
+#         ├── ar/
+#         │   ├── best.pt
+#         │   ├── last.pt
+#         │   └── step100.pt
+#         └── diff/
+#             ├── best.pt
+#             ├── last.pt
+#             └── step100.pt
+#     """
+
+#     # Identify model type
+#     model_name = model.__class__.__name__.lower()
+#     if "diffusion" in model_name or "diff" in model_name:
+#         subfolder = "diff"
+#     elif "arlanguage" in model_name or "ar" in model_name:
+#         subfolder = "ar"
+#     else:
+#         subfolder = "other"
+
+#     ckpt_dir = os.path.join(out_dir, subfolder)
+#     os.makedirs(ckpt_dir, exist_ok=True)
+
+#     # Construct checkpoint filename
+#     tag_clean = tag.replace("/", "_")
+#     fname = "best.pt" if best else f"{tag_clean}.pt"
+#     ckpt_path = os.path.join(ckpt_dir, fname)
+
+#     # Save model + optimizer state + metadata
+#     torch.save(
+#         {
+#             "state_dict": model.state_dict(),
+#             "optimizer": optimizer.state_dict() if optimizer else None,
+#             "step": step,
+#             "val_loss": val_loss,
+#         },
+#         ckpt_path,
+#     )
+
+#     print(f"💾 Saved checkpoint: {ckpt_path}")
+
 # ----------------------------------------------------
 # Early stopping
 # ----------------------------------------------------
