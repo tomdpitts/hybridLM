@@ -12,7 +12,7 @@ Outputs:
     tokenizer/vocab.json  # plain mapping usable by your model.py
 """
 # example usage:
-# python tokenizer.py --input data/input.txt --vocab_size 11000 --model_type bpe
+# python tokenizer.py --input data/train.txt --vocab_size 11000 --model_type bpe
 
 import os
 import argparse

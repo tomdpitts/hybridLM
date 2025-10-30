@@ -1,3 +1,4 @@
 venv
 NEXT_STEPS.txt
 ckpts
+data/*

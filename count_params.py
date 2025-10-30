@@ -5,8 +5,8 @@ Inspect total, category-wise parameter counts and memory footprint
 for ARLanguageModel (Stage-1) and DiffusionDecoder (Stage-2).
 
 Usage:
-    python count_params.py --ckpt ckpts/ar.pt
-    python count_params.py --ckpt ckpts/diff.pt --details
+    python count_params.py --ckpt ckpts/ar/ar.pt
+    python count_params.py --ckpt ckpts/diff/diff.pt --details
 """
 
 import argparse
