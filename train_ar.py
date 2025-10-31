@@ -23,6 +23,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from model import ARLanguageModel, ARConfig
+from contextlib import nullcontext # for the autocast_ctx() helper
 
 from utils_train import (
     split_dataset,
@@ -74,25 +75,65 @@ def main():
     parser.add_argument('--n_embd', type=int, default=128) #512
     parser.add_argument('--latent_dim', type=int, default=256) #512
     parser.add_argument('--batch_size', type=int, default=16)
-    parser.add_argument('--lr', type=float, default=3e-3) #3e-4
+    parser.add_argument('--lr', type=float, default=3e-4) #3e-4
     parser.add_argument('--weight_decay', type=float, default=0.01)
     parser.add_argument('--warmup_steps', type=int, default=10) #2000
     parser.add_argument('--max_steps', type=int, default=100) #20000
-    parser.add_argument('--eval_every', type=int, default=20) #1000 
+    parser.add_argument('--eval_every', type=int, default=50) #1000 
     parser.add_argument('--seed', type=int, default=5337)
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else ('cpu' if torch.backends.mps.is_available() else 'cpu'))
     
     parser.add_argument('--patience', type=int, default=5, help='Early stopping patience (eval intervals)')
     parser.add_argument('--val_ratio', type=float, default=0.1, help='Validation split ratio')
     parser.add_argument('--plot', action='store_true', help='Show live training/validation loss plot', default=True)
-    parser.add_argument('--print_interval', type=int, default=20, help='Print verbose training information every N steps')
-
+    parser.add_argument('--print_interval', type=int, default=10, help='Print verbose training information every N steps')
     
     args = parser.parse_args()
+
+    # --- Force immediate Colab output and timestamped logs ---
+    import builtins, datetime
+    def tprint(*args, **kwargs):
+        now = datetime.datetime.now().strftime("%H:%M:%S")
+        builtins.print(f"[{now}]", *args, **kwargs, flush=True)
+    print = tprint
+
+    # ====================================================
+    # GPU optimisation setup (safe across all environments)
+    # ====================================================
+    if torch.cuda.is_available():
+        cap = torch.cuda.get_device_capability()
+        if cap[0] >= 8:  # Ampere (A100, 3090, etc.)
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            print("✅ TF32 Tensor Core acceleration enabled")
+        else:
+            print("ℹ️ TF32 not supported on this GPU (capability < 8.0)")
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        print("ℹ️ Running on Apple Metal (MPS backend)")
+    else:
+        print("⚠️ Running on CPU backend")
+
+    # --- Device selection ---
+    device = torch.device(args.device)
+    print(f"🖥️  Using device: {device}")
+
+    # --- Decide AMP datatype automatically ---
+    use_cuda = (args.device.startswith("cuda") and torch.cuda.is_available())
+    cc_major = torch.cuda.get_device_capability()[0] if use_cuda else 0
+    amp_dtype = torch.bfloat16 if (use_cuda and cc_major >= 8) else torch.float16
+
+    # --- Modern PyTorch 2.x AMP / GradScaler ---
+    scaler = torch.amp.GradScaler(device="cuda", enabled=use_cuda)
+    print(f"🔧 AMP enabled: {scaler.is_enabled()} | dtype={amp_dtype}")
 
     torch.manual_seed(args.seed)
     random.seed(args.seed)
     os.makedirs(args.out_dir, exist_ok=True)
+    
+    # Create results directory for plots
+    results_dir = os.path.join(Path(args.out_dir).parent, "results", Path(args.out_dir).name)
+    os.makedirs(results_dir, exist_ok=True)
+    plotter = plot_losses(save_dir=results_dir)
 
     # Tokenizer and vocab size
     sp = spm.SentencePieceProcessor(model_file=args.spm)
@@ -123,83 +164,110 @@ def main():
         return sched.get_last_lr()[0]
 
     stopper = EarlyStopper(patience=args.patience)
-    plotter = plot_losses() if args.plot else None
 
     best_val_loss = float('inf')
 
-    # Training loop
+    # Choose context dynamically each call
+    def autocast_ctx():
+        return torch.amp.autocast("cuda", dtype=amp_dtype) if use_cuda else nullcontext()
+
+    # ====================================================
+    # Training loop (AMP + TF32 integrated)
+    # ====================================================
     step = 0
     model.train()
     running_loss = 0.0
     t0 = time.time()
+
+    # use the AMP context + GradScaler from setup block
     while step < args.max_steps:
         for ids, attn in train_dl:
             ids = ids.to(args.device)
             attn = attn.to(args.device)
-            logits = model(ids, attn)
-            # teacher forcing next-token loss
-            loss = F.cross_entropy(
-                logits[:, :-1, :].contiguous().view(-1, cfg.vocab_size),
-                ids[:, 1:].contiguous().view(-1),
-                ignore_index=0,  # ignore PAD
-            )
+
             opt.zero_grad(set_to_none=True)
-            loss.backward()
+
+            with autocast_ctx():
+                logits = model(ids, attn)
+                loss = F.cross_entropy(
+                    logits[:, :-1, :].contiguous().view(-1, cfg.vocab_size),
+                    ids[:, 1:].contiguous().view(-1),
+                    ignore_index=0,  # ignore PAD
+                )
+
+            # ---------------------------
+            # Backward + Optimiser step
+            # ---------------------------
+            scaler.scale(loss).backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
             # manual warmup
             for g in opt.param_groups:
-                g['lr'] = get_lr(step)
-            opt.step()
+                g["lr"] = get_lr(step)
+
+            scaler.step(opt)
+            scaler.update()
+
             if step >= args.warmup_steps:
                 sched.step()
 
+            # ---------------------------
+            # Logging
+            # ---------------------------
             running_loss += loss.item()
             if (step + 1) % args.print_interval == 0:
                 tok_per_step = ids.numel()
                 dt = time.time() - t0
-                print(f"step {step+1:06d} | loss {running_loss/100:.4f} | lr {opt.param_groups[0]['lr']:.2e} | {tok_per_step/1e6:.3f}M tok/it | {(step+1)/dt:.1f} it/s | time {dt:.2f} s")
+                print(
+                    f"step {step+1:06d} | "
+                    f"loss {running_loss/100:.4f} | "
+                    f"lr {opt.param_groups[0]['lr']:.2e} | "
+                    f"{tok_per_step/1e6:.3f}M tok/it | "
+                    f"{(step+1)/dt:.1f} it/s | time {dt:.2f} s"
+                )
                 running_loss = 0.0
-            if (step + 1) % args.eval_every == 0:
-                # --- Validation pass ---
+
+            # ---------------------------
+            # Evaluation / checkpointing
+            # ---------------------------
+            if step % args.eval_every == 0:
                 model.eval()
                 val_loss_total = 0.0
                 with torch.no_grad():
                     for v_ids, v_attn in val_dl:
                         v_ids, v_attn = v_ids.to(args.device), v_attn.to(args.device)
-                        v_logits = model(v_ids, v_attn)
-                        v_loss = F.cross_entropy(
-                            v_logits[:, :-1, :].contiguous().view(-1, cfg.vocab_size),
-                            v_ids[:, 1:].contiguous().view(-1),
-                            ignore_index=0,
-                        )
+                        with autocast_ctx():
+                            v_logits = model(v_ids, v_attn)
+                            v_loss = F.cross_entropy(
+                                v_logits[:, :-1, :].contiguous().view(-1, cfg.vocab_size),
+                                v_ids[:, 1:].contiguous().view(-1),
+                                ignore_index=0,
+                            )
                         val_loss_total += v_loss.item()
                 val_loss = val_loss_total / len(val_dl)
                 print(f"\nValidation loss: {val_loss:.4f}\n")
 
-                # --- Early stopping & checkpointing ---
-                save_checkpoint(model, opt, step, val_loss, args.out_dir, tag='last')
+                print(f"\nSaving checkpoint...")
+                save_checkpoint(model, opt, step, val_loss, args.out_dir, tag="last")
+                print(f"\nCheckpoint saved! Step: {step}")
                 improved = stopper.step(val_loss)
                 if improved:
-                    save_checkpoint(model, opt, step, val_loss, args.out_dir, tag=f'step{step}', best=True)
+                    save_checkpoint(model, opt, step, val_loss, args.out_dir, tag=f"step{step}", best=True)
                     best_val_loss = val_loss
                 if stopper.should_stop:
                     print(f"Early stopping triggered (no improvement for {args.patience} evals).\nBest val_loss={best_val_loss:.4f}")
                     break
 
-                # --- Live plot update ---
                 if plotter:
-                    plotter.update(step, running_loss / max(1, step % args.eval_every), val_loss)
+                    plotter.update(step + 1, running_loss / max(1, args.print_interval), val_loss)
                 model.train()
+
             step += 1
             if step >= args.max_steps:
                 break
 
-
-    if plotter:
-        plotter.close()
-
     # Save
-    save_path = os.path.join(args.out_dir, 'ar/ar.pt') # Note that the frozen model weights are saved to ar.pt
+    save_path = os.path.join(args.out_dir, 'ar.pt') # Note that the frozen model weights are saved to ar.pt
     torch.save({'config': cfg.__dict__, 'state_dict': model.state_dict(), 'spm': args.spm}, save_path)
     print(f"✅ Saved AR encoder to {save_path}")
 
@@ -208,8 +276,9 @@ def main():
 
     print(f"Total training time: {total_time:.2f} s")
     print(f"Average latency per iteration: {total_time/args.max_steps:.2f} s")
-    print(f"Total tokens: {ids.numel()}")
-    print(f"Throughput: {ids.numel()/total_time:.2f} tokens/s")
+    total_tokens = len(train_dl) * args.batch_size * args.max_len
+    print(f"Total tokens (approx): {total_tokens:,}")
+    print(f"Throughput: {total_tokens/total_time:.2f} tokens/s")
 
 if __name__ == '__main__':
     main()

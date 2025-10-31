@@ -48,53 +48,6 @@ def save_checkpoint(model, optimizer, step, val_loss, out_dir, tag="last", best=
         }, best_path)
     print(f"💾 Saved checkpoint to {ckpt_path} ({'best' if best else tag})")
 
-# def save_checkpoint(model, optimizer, step, val_loss, out_dir, tag="last", best=False):
-#     """
-#     Save checkpoint to disk, automatically grouping AR and Diffusion models into
-#     separate subdirectories under `out_dir`.
-
-#     Example:
-#         ckpts/
-#         ├── ar/
-#         │   ├── best.pt
-#         │   ├── last.pt
-#         │   └── step100.pt
-#         └── diff/
-#             ├── best.pt
-#             ├── last.pt
-#             └── step100.pt
-#     """
-
-#     # Identify model type
-#     model_name = model.__class__.__name__.lower()
-#     if "diffusion" in model_name or "diff" in model_name:
-#         subfolder = "diff"
-#     elif "arlanguage" in model_name or "ar" in model_name:
-#         subfolder = "ar"
-#     else:
-#         subfolder = "other"
-
-#     ckpt_dir = os.path.join(out_dir, subfolder)
-#     os.makedirs(ckpt_dir, exist_ok=True)
-
-#     # Construct checkpoint filename
-#     tag_clean = tag.replace("/", "_")
-#     fname = "best.pt" if best else f"{tag_clean}.pt"
-#     ckpt_path = os.path.join(ckpt_dir, fname)
-
-#     # Save model + optimizer state + metadata
-#     torch.save(
-#         {
-#             "state_dict": model.state_dict(),
-#             "optimizer": optimizer.state_dict() if optimizer else None,
-#             "step": step,
-#             "val_loss": val_loss,
-#         },
-#         ckpt_path,
-#     )
-
-#     print(f"💾 Saved checkpoint: {ckpt_path}")
-
 # ----------------------------------------------------
 # Early stopping
 # ----------------------------------------------------
@@ -116,36 +69,56 @@ class EarlyStopper:
                 self.should_stop = True
         return improved
 
-# ----------------------------------------------------
-# Loss plotting
-# ----------------------------------------------------
 class LiveLossPlot:
-    def __init__(self, title="Training vs Validation Loss"):
-        plt.ion()
-        self.fig, self.ax = plt.subplots()
+    def __init__(self, title="Training vs Validation Loss", save_path=None):
+        """
+        Colab-safe loss plotter.
+        - No interactive display
+        - Saves a single PNG plot that updates each eval
+        """
         self.title = title
+        self.save_path = save_path or "training_curve.png"
         self.train_losses = []
         self.val_losses = []
         self.steps = []
+
+        # Ensure directory exists
+        os.makedirs(os.path.dirname(self.save_path), exist_ok=True)
+
     def update(self, step, train_loss, val_loss=None):
+        """Record new losses and update the saved plot."""
         self.steps.append(step)
         self.train_losses.append(train_loss)
         if val_loss is not None:
             self.val_losses.append(val_loss)
-        self.ax.clear()
-        self.ax.plot(self.steps, self.train_losses, label='Train Loss', color='tab:blue')
-        if len(self.val_losses) > 0:
-            # align validation losses by step interval if shorter
-            val_x = self.steps[:len(self.val_losses)]
-            self.ax.plot(val_x, self.val_losses, label='Val Loss', color='tab:orange')
-        self.ax.set_xlabel('Step')
-        self.ax.set_ylabel('Loss')
-        self.ax.set_title(self.title)
-        self.ax.legend()
-        plt.pause(0.01)
-    def close(self):
-        plt.ioff()
-        plt.show()
 
-def plot_losses():
-    return LiveLossPlot()
+        plt.figure()
+        plt.plot(self.steps, self.train_losses, label="Train Loss", color="tab:blue")
+        if len(self.val_losses) > 0:
+            val_x = self.steps[:len(self.val_losses)]
+            plt.plot(val_x, self.val_losses, label="Val Loss", color="tab:orange")
+        plt.xlabel("Step")
+        plt.ylabel("Loss")
+        plt.title(self.title)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(self.save_path)
+        plt.close()
+        print(f"📉 Plot updated → {self.save_path}")
+
+    def close(self):
+        """No-op placeholder for API compatibility."""
+        pass
+
+
+def plot_losses(save_dir=None, title="Training vs Validation Loss"):
+    """
+    Creates a non-interactive plotter that saves a single .png file.
+    The file updates each eval and lives under results/ by default.
+    """
+    if save_dir is None:
+        save_path = "training_curve.png"
+    else:
+        os.makedirs(save_dir, exist_ok=True)
+        save_path = os.path.join(save_dir, "training_curve.png")
+    return LiveLossPlot(title=title, save_path=save_path)

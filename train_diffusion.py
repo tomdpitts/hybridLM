@@ -8,15 +8,15 @@
 
 '''
 python train_diffusion.py --corpus data/train.txt --spm tokenizer/spm.model \
-  --ar_ckpt ckpts/ar.pt --max_len 512 --batch_size 32 --lr 1e-4 \
+  --ar_ckpt ckpts/ar/ar.pt --max_len 512 --batch_size 32 --lr 3e-4 \
   --T 200 --schedule linear --eval_every 1000
 '''
 
 import math
 import os
 import time
-import argparse
 from pathlib import Path
+import argparse
 import sentencepiece as spm
 import torch
 import torch.nn.functional as F
@@ -24,6 +24,8 @@ from torch.utils.data import Dataset, DataLoader
 
 from model_diffusion import DiffConfig, DiffusionDecoder, corrupt_with_masks, masked_xent_loss, sample_iterative
 from model import ARLanguageModel, ARConfig  # from Phase 2
+
+from contextlib import nullcontext # for the autocast_ctx() helper
 
 from utils_train import (
     split_dataset,
@@ -77,11 +79,11 @@ def main():
     parser.add_argument('--out_dir', type=str, default='ckpts/diff')
     parser.add_argument('--max_len', type=int, default=256) #512
     parser.add_argument('--batch_size', type=int, default=32)
-    parser.add_argument('--lr', type=float, default=1e-3) #1e-4
+    parser.add_argument('--lr', type=float, default=3e-4) #1e-4
     parser.add_argument('--weight_decay', type=float, default=0.01)
     parser.add_argument('--warmup_steps', type=int, default=10) #100? Maybe 1000
-    parser.add_argument('--max_steps', type=int, default=101) #20000
-    parser.add_argument('--eval_every', type=int, default=20) #1000
+    parser.add_argument('--max_steps', type=int, default=100) #20000
+    parser.add_argument('--eval_every', type=int, default=50) #1000
     parser.add_argument('--T', type=int, default=200)
     parser.add_argument('--schedule', type=str, default='linear', choices=['linear','cosine'])
     parser.add_argument('--seed', type=int, default=1337)
@@ -90,12 +92,53 @@ def main():
     parser.add_argument('--patience', type=int, default=5, help='Early stopping patience (eval intervals)')
     parser.add_argument('--val_ratio', type=float, default=0.1, help='Validation split ratio')
     parser.add_argument('--plot', action='store_true', help='Show live training/validation loss plot', default=True)
-    parser.add_argument('--print_interval', type=int, default=5, help='Print verbose training information every N steps')
+    parser.add_argument('--print_interval', type=int, default=10, help='Print verbose training information every N steps')
     
     args = parser.parse_args()
 
+    # --- Force immediate Colab output and timestamped logs ---
+    import builtins, datetime
+    def tprint(*args, **kwargs):
+        now = datetime.datetime.now().strftime("%H:%M:%S")
+        builtins.print(f"[{now}]", *args, **kwargs, flush=True)
+    print = tprint
+
+    # ====================================================
+    # GPU optimisation setup (safe across all environments)
+    # ====================================================
+    if torch.cuda.is_available():
+        cap = torch.cuda.get_device_capability()
+        if cap[0] >= 8:  # Ampere (A100, 3090, etc.)
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            print("✅ TF32 Tensor Core acceleration enabled")
+        else:
+            print("ℹ️ TF32 not supported on this GPU (capability < 8.0)")
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        print("ℹ️ Running on Apple Metal (MPS backend)")
+    else:
+        print("⚠️ Running on CPU backend")
+
+    # --- Device selection ---
+    device = torch.device(args.device)
+    print(f"🖥️  Using device: {device}")
+
+    # --- Decide AMP datatype automatically ---
+    use_cuda = (args.device.startswith("cuda") and torch.cuda.is_available())
+    cc_major = torch.cuda.get_device_capability()[0] if use_cuda else 0
+    amp_dtype = torch.bfloat16 if (use_cuda and cc_major >= 8) else torch.float16
+
+    # --- Modern PyTorch 2.x AMP / GradScaler ---
+    scaler = torch.amp.GradScaler(device="cuda", enabled=use_cuda)
+    print(f"🔧 AMP enabled: {scaler.is_enabled()} | dtype={amp_dtype}")
+
     torch.manual_seed(args.seed)
     os.makedirs(args.out_dir, exist_ok=True)
+    
+    # Create results directory for plots
+    results_dir = os.path.join(Path(args.out_dir).parent, "results", Path(args.out_dir).name)
+    os.makedirs(results_dir, exist_ok=True)
+    plotter = plot_losses(save_dir=results_dir)
 
     # Tokenizer
     sp = spm.SentencePieceProcessor(model_file=args.spm)
@@ -125,10 +168,10 @@ def main():
         old_len, dim = ar.pos_emb.pe.shape
         if old_len < args.max_len:
             print(f"Extending sinusoidal PE from {old_len} → {args.max_len}")
-            device = ar.pos_emb.pe.device
-            position = torch.arange(0, args.max_len, dtype=torch.float, device=device).unsqueeze(1)
-            div_term = torch.exp(torch.arange(0, dim, 2, dtype=torch.float, device=device) * (-math.log(10000.0) / dim))
-            pe = torch.zeros(args.max_len, dim, device=device)
+            pe_device = ar.pos_emb.pe.device
+            position = torch.arange(0, args.max_len, dtype=torch.float, device=pe_device).unsqueeze(1)
+            div_term = torch.exp(torch.arange(0, dim, 2, dtype=torch.float, device=pe_device) * (-math.log(10000.0) / dim))
+            pe = torch.zeros(args.max_len, dim, device=pe_device)
             pe[:, 0::2] = torch.sin(position * div_term)
             pe[:, 1::2] = torch.cos(position * div_term)
             ar.pos_emb.pe = pe  # overwrite buffer with longer version
@@ -165,49 +208,61 @@ def main():
         return sched.get_last_lr()[0]
 
     stopper = EarlyStopper(patience=args.patience)
-    plotter = plot_losses() if args.plot else None
 
     best_val_loss = float('inf')
 
-    # Train loop
+    # Choose context dynamically each call
+    def autocast_ctx():
+        return torch.amp.autocast("cuda", dtype=amp_dtype) if use_cuda else nullcontext()
+
+    # ====================================================
+    # Training loop (AMP + TF32 integrated)
+    # ====================================================
     step = 0
-    running = 0.0
+    running_loss = 0.0
     t0 = time.time()
     diff.train()
+
+    # use the AMP context + GradScaler from setup block
     while step < args.max_steps:
         for ids, attn in train_dl:
             ids = ids.to(args.device)
             attn = attn.to(args.device)
             B = ids.size(0)
+            
             # get conditioning z from AR
             with torch.no_grad():
-                # z = ar.encode(ids, attn, pool='mean')  # (B, cond_dim)
                 z_global = ar.encode(ids, attn, pool='mean', raw=True, mode="global")         # (B, n_embd)
-                z_chunks, chunk_mask = ar.encode(ids, attn, pool='mean', raw=True, mode="chunked")  # (B, num_chunks, D),
+                # z_chunks, chunk_mask = ar.encode(ids, attn, pool='mean', raw=True, mode="chunked")  # (B, num_chunks, D), leaving for future experiment
+            
             # sample random timestep
             t = torch.randint(low=1, high=diff_cfg.T + 1, size=(B,), device=args.device)
             # corrupt
             x_noisy, predict_mask = corrupt_with_masks(ids, pad_id, mask_id, t, diff_cfg.T, schedule=args.schedule)
-            # forward
-            logits = diff(x_noisy, attn, t, z_global)
-            loss = masked_xent_loss(logits, ids, predict_mask, pad_id)
-            # step
+            
             opt.zero_grad(set_to_none=True)
-            loss.backward()
+            with autocast_ctx():
+                logits = diff(x_noisy, attn, t, z_global)
+                loss = masked_xent_loss(logits, ids, predict_mask, pad_id)
+
+            scaler.scale(loss).backward()
             torch.nn.utils.clip_grad_norm_(diff.parameters(), 1.0)
+            
             # warmup + cosine
             for g in opt.param_groups:
                 g['lr'] = get_lr(step)
-            opt.step()
+            scaler.step(opt)
+            scaler.update()
+
             if step >= args.warmup_steps:
                 sched.step()
 
-            running += loss.item()
+            running_loss += loss.item()
             step += 1
             if step % args.print_interval == 0:
                 dt = time.time() - t0
-                print(f"step {step:06d} | loss {running/100:.4f} | lr {opt.param_groups[0]['lr']:.2e} | {(step)/dt:.1f} it/s | time {dt:.2f} s")
-                running = 0.0
+                print(f"step {step:06d} | loss {running_loss/args.print_interval:.4f} | lr {opt.param_groups[0]['lr']:.2e} | {(step)/dt:.1f} it/s | time {dt:.2f} s")
+                running_loss = 0.0
             if step % args.eval_every == 0:
                 # --- Validation + Sampling ---
                 diff.eval()
@@ -217,11 +272,12 @@ def main():
                     for v_ids, v_attn in val_dl:
                         v_ids, v_attn = v_ids.to(args.device), v_attn.to(args.device)
                         Bv = v_ids.size(0)
-                        z_val = ar.encode(v_ids, v_attn, pool='mean')
+                        z_val = ar.encode(v_ids, v_attn, pool='mean', raw=True, mode="global")
                         t_val = torch.randint(low=1, high=diff_cfg.T + 1, size=(Bv,), device=args.device)
                         x_noisy, predict_mask = corrupt_with_masks(v_ids, pad_id, mask_id, t_val, diff_cfg.T, schedule=args.schedule)
-                        v_logits = diff(x_noisy, v_attn, t_val, z_val)
-                        v_loss = masked_xent_loss(v_logits, v_ids, predict_mask, pad_id)
+                        with autocast_ctx():
+                            v_logits = diff(x_noisy, v_attn, t_val, z_val)
+                            v_loss = masked_xent_loss(v_logits, v_ids, predict_mask, pad_id)
                         val_loss_total += v_loss.item()
                     val_loss = val_loss_total / len(val_dl)
                 print(f"\nValidation loss: {val_loss:.4f}\n")
@@ -251,8 +307,8 @@ def main():
                     print(f"Early stopping triggered (no improvement for {args.patience} evals). Best val_loss={best_val_loss:.4f}")
                     break
 
-                # if plotter:
-                #     plotter.update(step, running / max(1, step % args.eval_every), val_loss)
+                if plotter:
+                    plotter.update(step + 1, running_loss / max(1, args.print_interval), val_loss)
 
                 diff.train()
             if step >= args.max_steps:
@@ -271,8 +327,9 @@ def main():
 
     print(f"Total training time: {total_time:.2f} s")
     print(f"Average latency per iteration: {total_time/args.max_steps:.2f} s")
-    print(f"Total tokens: {ids.numel()}")
-    print(f"Throughput: {ids.numel()/total_time:.2f} tokens/s")
+    total_tokens = len(train_dl) * args.batch_size * args.max_len
+    print(f"Total tokens (approx): {total_tokens:,}")
+    print(f"Throughput: {total_tokens/total_time:.2f} tokens/s")
 
 if __name__ == '__main__':
     main()

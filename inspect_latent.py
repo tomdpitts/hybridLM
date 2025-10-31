@@ -74,8 +74,8 @@ def main():
             sim = cosine_similarity(projs[i], projs[j], dim=-1)
             print(f"({args.prompts[i]!r}, {args.prompts[j]!r}) = {sim.item():.4f}")
 
-    plot_pca(raws.numpy(), args.prompts, "Raw latent space (PCA)")
-    plot_pca(projs.numpy(), args.prompts, "Projected latent space (PCA)")
+    # plot_pca(raws.numpy(), args.prompts, "Raw latent space (PCA)")
+    # plot_pca(projs.numpy(), args.prompts, "Projected latent space (PCA)")
 
 
 if __name__ == "__main__":

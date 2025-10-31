@@ -59,47 +59,122 @@ def main():
     parser.add_argument('--ar_ckpt', type=str, default='ckpts/ar/ar.pt')
     parser.add_argument('--diff_ckpt', type=str, default='ckpts/diff/diff.pt')
     parser.add_argument('--prompt', type=str, default='Once upon a time,')
-    parser.add_argument('--max_len', type=int, default=512)
-    parser.add_argument('--steps', type=int, default=64, help='Sampling steps (<= training T)')
+    parser.add_argument('--max_len', type=int, default=None) #512
+    parser.add_argument('--steps', type=int, default=None, help='Sampling steps (<= training T)') #64
     parser.add_argument('--topk', type=int, default=50)
     parser.add_argument('--length', type=int, default=0, help='Optional explicit target length (incl. BOS/EOS)')
+    parser.add_argument('--chat', action='store_true', help='Enable interactive multi-turn chat mode')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu'))
     parser.add_argument('--seed', type=int, default=1337)
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
 
-    # Tokenizer and special IDs
+    # -------------------------
+    # Tokenizer & special tokens
+    # -------------------------
     sp = spm.SentencePieceProcessor(model_file=args.spm)
     pad_id, bos_id, eos_id = 0, 2, 3
     mask_id = sp.piece_to_id('[MASK]')
     assert mask_id >= 0, 'Your tokenizer must include [MASK] as user_defined_symbols.'
 
+    # -------------------------
     # Load AR encoder
+    # -------------------------
     ar_ckpt = torch.load(args.ar_ckpt, map_location='cpu')
     ar_cfg = ARConfig(**ar_ckpt['config'])
     ar = ARLanguageModel(ar_cfg).to(args.device)
     ar.load_state_dict(ar_ckpt['state_dict'])
     ar.eval()
 
+    # -------------------------
     # Load diffusion decoder
+    # -------------------------
     diff_ckpt = torch.load(args.diff_ckpt, map_location='cpu')
     diff_cfg = DiffConfig(**diff_ckpt['config'])
-    # allow overriding max_len/T for faster sampling
-    diff_cfg.max_len = args.max_len
-    diff_cfg.T = max(args.steps, 1)
+
+    # Infer actual capacities from weights (always reliable)
+    ar_max_len = getattr(ar.pos_emb.pe, "shape", [None, None])[0] if hasattr(ar, "pos_emb") else 256
+    diff_max_len = getattr(diff_cfg, "max_len", 256)
+    diff_T = getattr(diff_cfg, "T", 200)
+
+    # If user omitted flags, auto-infer from checkpoints
+    if args.max_len is None:
+        args.max_len = min(ar_max_len, diff_max_len)
+    if args.steps is None:
+        args.steps = diff_T
+
+    # Clamp safely
+    sampling_steps = min(args.steps, diff_cfg.T)
+    if args.max_len <= diff_cfg.max_len:
+        diff_cfg.max_len = args.max_len
+
     diff = DiffusionDecoder(diff_cfg).to(args.device)
     diff.load_state_dict(diff_ckpt['state_dict'])
     diff.eval()
 
-    # Encode prompt to z
-    z = encode_prompt_to_z(ar, sp, args.prompt, args.max_len, args.device)  # (1, cond_dim)
+    # ======================================================
+    # MODE 1 — Interactive Chat
+    # ======================================================
+    if args.chat:
+        print("=== HybridLM Interactive Chat ===")
+        print("Type 'exit' to quit.\n")
+        history = []
+
+        while True:
+            user_input = input("You: ").strip()
+            if user_input.lower() in {"exit", "quit"}:
+                print("Goodbye!")
+                break
+
+            # build short rolling context (last few turns)
+            context_text = ""
+            for speaker, text in history[-4:]:  # last 4 exchanges
+                context_text += f"{speaker}: {text}\n"
+            prompt_full = context_text + f"User: {user_input}\nModel:"
+
+            # encode → z
+            z = encode_prompt_to_z(ar, sp, prompt_full, args.max_len, args.device)
+
+            # target length heuristic
+            target_len = build_initial_lengths(sp, prompt_full, args.max_len)
+            lengths = torch.tensor([target_len], device=args.device)
+
+            # diffusion sampling
+            toks = sample_iterative(
+                model=diff,
+                lengths=lengths,
+                z=z,
+                pad_id=pad_id,
+                mask_id=mask_id,
+                T=sampling_steps,
+                bos_id=bos_id,
+                eos_id=eos_id,
+                topk=args.topk,
+                device=args.device,
+            )[0]
+
+            # decode + print
+            text = decode_tokens(sp, toks, bos_id=bos_id, eos_id=eos_id, pad_id=pad_id)
+            print(f"Model: {text}\n")
+
+            # save to conversation history
+            history.append(("User", user_input))
+            history.append(("Model", text))
+        return  # exit after chat mode
+
+    # ======================================================
+    # MODE 2 — One-shot generation (default)
+    # ======================================================
+
+    # Encode prompt to latent
+    z = encode_prompt_to_z(ar, sp, args.prompt, args.max_len, args.device)
 
     # Determine target length
     target_len = args.length if args.length > 0 else build_initial_lengths(sp, args.prompt, args.max_len)
     lengths = torch.tensor([target_len], device=args.device)
 
-    # Sample
+    # Diffusion sampling
     toks = sample_iterative(
         model=diff,
         lengths=lengths,
